@@ -10,6 +10,10 @@ on:
     branches:
       - main
   pull_request:
+  # A run that fails at startup — an action not yet on the org allowlist, say —
+  # produces no jobs and cannot be re-run from the API, so there has to be a way
+  # to start a fresh one without an empty commit. `main` is push-protected.
+  workflow_dispatch:
 
 permissions:
   contents: read
