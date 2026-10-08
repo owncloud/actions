@@ -1,0 +1,238 @@
+name: 'oCIS Test'
+author: 'ownCloud'
+description: 'Run oCIS Behat acceptance tests, litmus WebDAV tests, or WOPI validator tests against a running oCIS instance.'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  suite:
+    description: Behat suite(s) to run, comma-separated (e.g. apiGraph or apiAntivirus,apiSettings), "litmus" to run litmus WebDAV tests, or "wopi-builtin" / "wopi-cs3" to run WOPI validator tests
+    required: true
+  ocis-url:
+    description: oCIS instance URL
+    required: false
+    default: https://localhost:9200
+  expected-failures-file:
+    description: Path to a pre-merged expected failures file; if omitted the standard files are merged automatically
+    required: false
+    default: ""
+  acceptance-test-type:
+    description: Test type passed as ACCEPTANCE_TEST_TYPE (api or core-api)
+    required: false
+    default: api
+  with-remote-php:
+    description: Include remote.php expected failures (WITH_REMOTE_PHP)
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # =========================================================================
+    # Litmus WebDAV tests (suite: litmus)
+    # =========================================================================
+    - name: Setup litmus fixtures
+      if: inputs.suite == 'litmus'
+      shell: bash
+      env:
+        OCIS_URL: ${{ inputs.ocis-url }}
+      run: |
+        # Get admin personal space ID
+        SPACE_ID=$(curl -sk -uadmin:admin "${OCIS_URL}/graph/v1.0/me/drives" \
+          | jq -r '.value[] | select(.driveType=="personal") | .root.webDavUrl | split("/") | last')
+        echo "LITMUS_SPACE_ID=${SPACE_ID}" >> "$GITHUB_ENV"
+        echo "Space ID: ${SPACE_ID}"
+
+        # Create test folder as einstein
+        curl -sk -ueinstein:relativity -X MKCOL \
+          "${OCIS_URL}/remote.php/webdav/litmus_folder" > /dev/null
+
+        # Share einstein's folder with admin
+        SHARE_RESP=$(curl -sk -ueinstein:relativity \
+          "${OCIS_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares" \
+          -d "path=/litmus_folder&shareType=0&permissions=15&name=litmus_folder&shareWith=admin")
+        SHARE_ID=$(echo "$SHARE_RESP" | grep -oP '(?<=<id>)[^<]+' | head -1)
+        if [[ -n "$SHARE_ID" ]]; then
+          curl -X POST -sk -uadmin:admin \
+            "${OCIS_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares/pending/${SHARE_ID}" \
+            > /dev/null
+          echo "Share accepted (ID: ${SHARE_ID})"
+        fi
+
+        # Public link on the folder
+        curl -sk -ueinstein:relativity \
+          "${OCIS_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares" \
+          -d "path=/litmus_folder&shareType=3&permissions=15&name=litmus_folder" > /dev/null
+        echo "Public link created."
+
+    - name: Run litmus tests
+      if: inputs.suite == 'litmus'
+      shell: bash
+      env:
+        OCIS_URL: ${{ inputs.ocis-url }}
+        LITMUS_SPACE_ID: ${{ env.LITMUS_SPACE_ID }}
+      run: |
+        # Use OCIS_DOCKER_URL (bridge IP) when available so Docker containers can
+        # reach oCIS on the host; fall back to OCIS_URL for local/direct runs.
+        BASE="${OCIS_DOCKER_URL:-${OCIS_URL}}"
+        LITMUS_IMAGE="owncloudci/litmus@sha256:e44053de2d47d44aedfe9b3db6f0000188b886f4be1a3c052e66ef3f635d2a17"
+        FAILED=()
+
+        run_litmus() {
+          local name=$1 endpoint=$2
+          echo "=== litmus [${name}]: ${endpoint} ==="
+          docker run --rm \
+            -e "LITMUS_URL=${endpoint}" \
+            -e LITMUS_USERNAME=admin \
+            -e LITMUS_PASSWORD=admin \
+            -e "TESTS=basic copymove props http" \
+            "$LITMUS_IMAGE" || FAILED+=("$name")
+        }
+
+        run_litmus "old-endpoint"    "${BASE}/remote.php/webdav"
+        run_litmus "new-endpoint"    "${BASE}/remote.php/dav/files/admin"
+        run_litmus "new-shared"      "${BASE}/remote.php/dav/files/admin/Shares/litmus_folder/"
+        run_litmus "old-shared"      "${BASE}/remote.php/webdav/Shares/litmus_folder/"
+        run_litmus "spaces-endpoint" "${BASE}/remote.php/dav/spaces/${LITMUS_SPACE_ID}"
+
+        if [[ ${#FAILED[@]} -gt 0 ]]; then
+          echo "Failed litmus endpoints: ${FAILED[*]}"
+          exit 1
+        fi
+        echo "All litmus tests passed."
+
+    # =========================================================================
+    # cs3api validator (suite: cs3api)
+    # =========================================================================
+    - name: Run cs3api validator
+      if: inputs.suite == 'cs3api'
+      shell: bash
+      run: |
+        docker run --rm --network host \
+          --entrypoint /usr/bin/cs3api-validator \
+          owncloud/cs3api-validator:0.2.1 \
+          /var/lib/cs3api-validator \
+          --endpoint="localhost:9142"
+
+    # =========================================================================
+    # WOPI validator tests (suite: wopi-builtin or wopi-cs3)
+    # =========================================================================
+    - name: Prepare WOPI test file and extract tokens
+      if: startsWith(inputs.suite, 'wopi-')
+      shell: bash
+      env:
+        OCIS_URL: ${{ inputs.ocis-url }}
+        SUITE: ${{ inputs.suite }}
+      run: |
+        # Upload test file; capture response headers for file ID
+        curl -sk -uadmin:admin -X PUT \
+          --fail --retry-connrefused --retry 7 --retry-all-errors \
+          "${OCIS_URL}/remote.php/webdav/test.wopitest" \
+          -D /tmp/wopi-headers.txt
+
+        FILE_ID=$(grep -i 'Oc-Fileid:' /tmp/wopi-headers.txt | sed 's/.*: *//' | tr -d '\r\n\t ')
+        echo "FILE_ID=${FILE_ID}"
+
+        FILE_ID_ENC=$(jq -rn --arg v "$FILE_ID" '$v | @uri')
+
+        OPEN=$(curl -sk -uadmin:admin -X POST --fail \
+          --retry-connrefused --retry 7 --retry-all-errors \
+          "${OCIS_URL}/app/open?app_name=FakeOffice&file_id=${FILE_ID_ENC}")
+        echo "open: ${OPEN:0:400}"
+
+        ACCESS_TOKEN=$(echo "$OPEN" | jq -r '.form_parameters.access_token')
+        TTL=$(echo "$OPEN"          | jq -r '.form_parameters.access_token_ttl // 0')
+        APP_URL=$(echo "$OPEN"      | jq -r '.app_url // ""')
+
+        # Extract encoded file ID from app_url, fall back to re-encoding FILE_ID
+        if echo "$APP_URL" | grep -q 'files%2F'; then
+          FILE_ID_ENC=$(echo "$APP_URL" | sed 's/.*files%2F//' | cut -d'?' -f1)
+        elif echo "$APP_URL" | grep -q 'files/'; then
+          FILE_ID_ENC=$(echo "$APP_URL" | sed 's/.*files\///' | cut -d'?' -f1)
+        elif [[ -n "$APP_URL" ]]; then
+          echo "WARNING: unrecognized APP_URL format: $APP_URL" >&2
+        fi
+
+        # WOPI_PORT is exported by ocis-setup (9320 for fakeoffice/builtin, 9300 for cs3-wopi)
+        WOPI_SRC="http://localhost:${WOPI_PORT}/wopi/files/${FILE_ID_ENC}"
+        echo "WOPI_SRC=${WOPI_SRC}"
+
+        echo "WOPI_ACCESS_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+        echo "WOPI_TTL=${TTL}"                   >> "$GITHUB_ENV"
+        echo "WOPI_SRC=${WOPI_SRC}"              >> "$GITHUB_ENV"
+
+    - name: Run WOPI validator
+      if: startsWith(inputs.suite, 'wopi-')
+      shell: bash
+      env:
+        SUITE: ${{ inputs.suite }}
+        WOPI_ACCESS_TOKEN: ${{ env.WOPI_ACCESS_TOKEN }}
+        WOPI_TTL: ${{ env.WOPI_TTL }}
+        WOPI_SRC: ${{ env.WOPI_SRC }}
+      run: |
+        VALIDATOR_IMAGE="owncloudci/wopi-validator"
+        FAILED=()
+
+        SHARED_GROUPS=(BaseWopiViewing CheckFileInfoSchema EditFlows Locks AccessTokens GetLock ExtendedLockLength FileVersion Features)
+        BUILTIN_GROUPS=(PutRelativeFile RenameFileIfCreateChildFileIsNotSupported)
+
+        run_group() {
+          local group=$1 secure_flag=${2:-}
+          echo "=== wopi-validator [${group}] ==="
+          docker run --rm --network host --workdir /app \
+            --entrypoint /app/Microsoft.Office.WopiValidator \
+            "$VALIDATOR_IMAGE" \
+            ${secure_flag:+-s} -t "$WOPI_ACCESS_TOKEN" -w "$WOPI_SRC" -l "$WOPI_TTL" \
+            --testgroup "$group" || FAILED+=("$group")
+        }
+
+        for group in "${SHARED_GROUPS[@]}"; do run_group "$group"; done
+        if [[ "$SUITE" == "wopi-builtin" ]]; then
+          for group in "${BUILTIN_GROUPS[@]}"; do run_group "$group" secure; done
+        fi
+
+        if [[ ${#FAILED[@]} -gt 0 ]]; then
+          echo "Failed testgroups: ${FAILED[*]}"
+          exit 1
+        fi
+        echo "All WOPI validator tests passed."
+
+    # =========================================================================
+    # Behat acceptance tests (all other suites)
+    # =========================================================================
+    - name: Merge expected failures files
+      if: "!startsWith(inputs.suite, 'litmus') && !startsWith(inputs.suite, 'wopi-') && inputs.suite != 'cs3api' && inputs.expected-failures-file == ''"
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        ACCEPTANCE_TEST_TYPE: ${{ inputs.acceptance-test-type }}
+      run: |
+        if [[ "$ACCEPTANCE_TEST_TYPE" == "core-api" ]]; then
+          cp tests/acceptance/expected-failures-API-on-OCIS-storage.md /tmp/expected-failures-auto.md
+        else
+          cat tests/acceptance/expected-failures-localAPI-on-OCIS-storage.md \
+              tests/acceptance/expected-failures-without-remotephp.md \
+              > /tmp/expected-failures-auto.md
+        fi
+        echo "EXPECTED_FAILURES_AUTO=/tmp/expected-failures-auto.md" >> "$GITHUB_ENV"
+
+    - name: Run ${{ inputs.suite }}
+      if: "!startsWith(inputs.suite, 'litmus') && !startsWith(inputs.suite, 'wopi-') && inputs.suite != 'cs3api'"
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        BEHAT_SUITES: ${{ inputs.suite }}
+        TEST_SERVER_URL: ${{ inputs.ocis-url }}
+        OCIS_WRAPPER_URL: http://localhost:5200
+        ACCEPTANCE_TEST_TYPE: ${{ inputs.acceptance-test-type }}
+        WITH_REMOTE_PHP: ${{ inputs.with-remote-php }}
+        EXPECTED_FAILURES_FILE: ${{ inputs.expected-failures-file != '' && inputs.expected-failures-file || env.EXPECTED_FAILURES_AUTO }}
+        STORAGE_DRIVER: ocis
+        UPLOAD_DELETE_WAIT_TIME: "0"
+        EMAIL_HOST: localhost
+        EMAIL_PORT: "8025"
+        # Filter tags mirror run-github.py logic
+        BEHAT_FILTER_TAGS: ${{ inputs.acceptance-test-type == 'core-api' && '~@skipOnGraph&&~@skipOnOcis-OCIS-Storage' || '~@skip&&~@skipOnGraph&&~@skipOnOcis-OCIS-Storage' }}
+      run: make test-acceptance-api

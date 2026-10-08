@@ -1,0 +1,30 @@
+name: oCIS actions metadata
+
+# actionlint validates a local action's action.yml only when a workflow references
+# it by its in-repo path as `uses: ./<folder>` (see .github/workflows/lint.yml). This
+# workflow gives ocis-setup/ and ocis-test/ that reference so their inputs/outputs
+# schema is checked in CI.
+#
+# The job never executes (`github.run_id` is never 0). The actions run FROM a checkout
+# of owncloud/ocis at the workspace root, so a real end-to-end run requires that repo
+# and lives there (owncloud/ocis), not here. actionlint reads `uses:` statically and
+# validates the metadata regardless of the job condition.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate action metadata (lint-only, never runs)
+    if: ${{ github.run_id == '0' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./ocis-setup
+        with:
+          ocis-version: latest
+      - uses: ./ocis-test
+        with:
+          suite: apiGraph

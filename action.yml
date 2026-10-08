@@ -1,0 +1,14 @@
+name: ownCloud Actions
+description: A collection of reusable, step-level actions for the ownCloud organisation.
+
+runs:
+  using: "composite"
+  steps:
+    - run: |
+        echo "::error::The path 'owncloud/actions' is not a valid action. Please use 'owncloud/actions/ocis-setup' or 'owncloud/actions/ocis-test'."
+        exit 1
+      shell: bash
+
+branding:
+  icon: 'box'
+  color: 'gray-dark'

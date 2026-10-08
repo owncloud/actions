@@ -34,15 +34,19 @@ jobs:
           # action-specific inputs
 ```
 
-There is deliberately **no action at the repository root**: this repository is a
-collection, not a single action. `uses: owncloud/actions@v1` is not valid — always
-include the folder.
+The repository root `action.yml` is a guard, not a usable action: this repository is
+a collection, not a single action. `uses: owncloud/actions@v1` fails with an error
+pointing you at the right folder — always include it.
 
 ## Available Actions
 
 | Action | Reference | Purpose |
 |---|---|---|
-| _none yet_ | | The first actions land with the migration of the oCIS CI actions ([owncloud/admin#218](https://github.com/owncloud/admin/issues/218)). |
+| `ocis-setup` | `uses: owncloud/actions/ocis-setup@v1` | Install an oCIS binary (release or pre-built) and start an instance with optional services — antivirus, email, full-text search, Keycloak IDP, WOPI collaboration apps. |
+| `ocis-test` | `uses: owncloud/actions/ocis-test@v1` | Run oCIS Behat acceptance suites, litmus WebDAV tests, cs3api validator, or WOPI validator tests against a running instance. |
+
+These actions were migrated from `mklos-kw/ocis-github-actions`
+([owncloud/admin#218](https://github.com/owncloud/admin/issues/218)).
 
 ## Versioning
 

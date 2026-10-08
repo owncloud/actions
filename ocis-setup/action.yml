@@ -1,0 +1,647 @@
+name: 'oCIS Setup'
+author: 'ownCloud'
+description: 'Start an oCIS instance with optional services (antivirus, email, tika, collaboration apps).'
+
+branding:
+  icon: 'server'
+  color: 'blue'
+
+inputs:
+  ocis-version:
+    description: oCIS release version (e.g. 8.0.1) or "latest" — ignored when ocis-binary is set
+    required: false
+    default: latest
+  ocis-binary:
+    description: Path to a pre-built oCIS binary; skips download when provided
+    required: false
+    default: ""
+  ocis-binary-artifact:
+    description: Artifact name to download the oCIS binary from (downloads to ocis/bin/ocis and sets ocis-binary automatically)
+    required: false
+    default: ""
+  ociswrapper-artifact:
+    description: Artifact name to download ociswrapper from (downloads to /usr/local/bin/ociswrapper)
+    required: false
+    default: ""
+  admin-password:
+    description: Admin user password
+    required: false
+    default: admin
+  log-level:
+    description: oCIS log level
+    required: false
+    default: error
+  demo-users:
+    description: Create demo users (IDM_CREATE_DEMO_USERS=true)
+    required: false
+    default: "false"
+  wrapper:
+    description: Start ociswrapper on :5200 for dynamic reconfiguration; set to "false" to run ocis server directly
+    required: false
+    default: "true"
+  tika:
+    description: Start Apache Tika on :9998 for full-text search
+    required: false
+    default: "false"
+  email:
+    description: Start Mailpit SMTP (:1025) and API (:8025)
+    required: false
+    default: "false"
+  antivirus:
+    description: Start ClamAV on :3310 and enable postprocessing
+    required: false
+    default: "false"
+  extra-server-env:
+    description: JSON object of additional env vars to pass to the oCIS server
+    required: false
+    default: "{}"
+  keycloak:
+    description: Start oCIS with Keycloak as external IDP (uses ocis server directly, skips ociswrapper)
+    required: false
+    default: "false"
+  ocis-url:
+    description: oCIS base URL used for init and server startup (use https://127.0.0.1:9200 for e2e tests)
+    required: false
+    default: "https://localhost:9200"
+  ocis-config-dir:
+    description: oCIS config directory path; defaults to ~/.ocis/config
+    required: false
+    default: ""
+  pid-file:
+    description: File path to write the oCIS process PID
+    required: false
+    default: /tmp/ocis-wrapper.pid
+  log-file:
+    description: File path for oCIS server log output
+    required: false
+    default: /tmp/ocis-server.log
+  skip-test-runner-setup:
+    description: Skip PHP/libcurl/Composer setup (set to "true" for secondary instances that share the test runner)
+    required: false
+    default: "false"
+  collaboration-apps:
+    description: Comma-separated WOPI apps to start — collabora, onlyoffice, fakeoffice, cs3-wopi (cs3org/wopiserver + fakeoffice)
+    required: false
+    default: ""
+  collabora-image:
+    description: Collabora CODE Docker image
+    required: false
+    default: collabora/code:24.04.5.1.1
+  onlyoffice-image:
+    description: OnlyOffice Document Server Docker image
+    required: false
+    default: onlyoffice/documentserver:9.0.0
+  debug-port-offset:
+    description: Shift all service port numbers (gRPC, HTTP, debug) by this amount — use 1000 for a secondary instance to avoid collisions with the primary
+    required: false
+    default: "0"
+  web-ui-config:
+    description: Path to web UI config JSON; the Docker Compose hostname (ocis-server:9200) is rewritten to match ocis-url so the file works in CI
+    required: false
+    default: ""
+  docker-accessible:
+    description: Bind oCIS to the Docker bridge IP so containers can reach it; exports OCIS_BRIDGE_IP and OCIS_DOCKER_URL
+    required: false
+    default: "false"
+  keycloak-realm-file:
+    description: Path (relative to repo root) to the Keycloak realm dist JSON; only used when keycloak=true
+    required: false
+    default: tests/config/ci/ocis-ci-realm.dist.json
+  app-registry-file:
+    description: Path (relative to repo root) to a custom app-registry.yaml; replaces the built-in default before oCIS starts
+    required: false
+    default: ""
+
+outputs:
+  ocis-url:
+    description: oCIS instance URL
+    value: ${{ inputs.ocis-url }}
+  wopi-url:
+    description: WOPI source base URL (http://localhost:PORT); only set when collaboration-apps is non-empty
+    value: ${{ steps.wopi-url.outputs.wopi-url }}
+  keycloak-domain:
+    description: Keycloak domain (host:port); only set when keycloak=true
+    value: localhost:8443
+
+runs:
+  using: composite
+  steps:
+    # -------------------------------------------------------------------------
+    # 0. Download artifacts (when callers use artifact names instead of paths)
+    # -------------------------------------------------------------------------
+    - name: Download oCIS binary artifact
+      if: inputs.ocis-binary-artifact != ''
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ inputs.ocis-binary-artifact }}
+        path: ocis/bin
+
+    - name: Download ociswrapper artifact
+      if: inputs.ociswrapper-artifact != '' && inputs.wrapper != 'false'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        name: ${{ inputs.ociswrapper-artifact }}
+        path: /usr/local/bin
+
+    - name: Mark ociswrapper executable
+      if: inputs.ociswrapper-artifact != '' && inputs.wrapper != 'false'
+      shell: bash
+      run: chmod +x /usr/local/bin/ociswrapper
+
+    # -------------------------------------------------------------------------
+    # 1. Install oCIS binary (skip when a pre-built binary is provided)
+    # -------------------------------------------------------------------------
+    - name: Install libvips runtime
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo NEEDRESTART_MODE=a apt-get install -y libvips42t64
+
+    - name: Install oCIS binary from release
+      if: inputs.ocis-binary == '' && inputs.ocis-binary-artifact == ''
+      shell: bash
+      env:
+        OCIS_VERSION: ${{ inputs.ocis-version }}
+      run: ${{ github.action_path }}/scripts/install-ocis.sh
+
+    - name: Use pre-built oCIS binary
+      if: inputs.ocis-binary != '' && inputs.ocis-binary-artifact == ''
+      shell: bash
+      env:
+        OCIS_BINARY: ${{ inputs.ocis-binary }}
+      run: |
+        sudo install -m 0755 "${OCIS_BINARY}" /usr/local/bin/ocis
+        echo "Using pre-built oCIS: $(ocis --version 2>&1 | head -1)"
+
+    - name: Install artifact oCIS binary system-wide
+      if: inputs.ocis-binary-artifact != ''
+      shell: bash
+      run: |
+        sudo install -m 0755 ocis/bin/ocis /usr/local/bin/ocis
+        echo "Using oCIS from artifact: $(ocis --version 2>&1 | head -1)"
+
+    # -------------------------------------------------------------------------
+    # 2. Build ociswrapper (only when using ociswrapper mode)
+    # -------------------------------------------------------------------------
+    - name: Build ociswrapper from source (when using release binary)
+      if: inputs.ocis-binary == '' && inputs.ocis-binary-artifact == '' && inputs.wrapper != 'false' && inputs.keycloak != 'true'
+      shell: bash
+      env:
+        OCIS_VERSION: ${{ inputs.ocis-version }}
+      run: ${{ github.action_path }}/scripts/install-wrapper.sh
+
+    - name: Build ociswrapper from local source (when using pre-built binary)
+      if: (inputs.ocis-binary != '' || inputs.ocis-binary-artifact != '') && inputs.ociswrapper-artifact == '' && inputs.wrapper != 'false' && inputs.keycloak != 'true'
+      shell: bash
+      working-directory: ${{ github.workspace }}/tests/ociswrapper
+      run: |
+        if command -v ociswrapper &>/dev/null; then
+          echo "ociswrapper already installed: $(ociswrapper --version 2>&1 | head -1)"
+        else
+          GOWORK=off go build -o /tmp/ociswrapper .
+          sudo mv /tmp/ociswrapper /usr/local/bin/ociswrapper
+          echo "ociswrapper built from local source."
+        fi
+
+    # -------------------------------------------------------------------------
+    # 3. Optional services
+    # -------------------------------------------------------------------------
+    - name: Start Keycloak stack
+      if: inputs.keycloak == 'true'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        OCIS_URL: ${{ inputs.ocis-url }}
+        REALM_DIST: ${{ inputs.keycloak-realm-file }}
+      run: |
+        # Start Postgres early so its pull/boot overlaps with cert generation
+        docker run -d --name postgres --network host \
+          -e POSTGRES_DB=keycloak \
+          -e POSTGRES_USER=keycloak \
+          -e POSTGRES_PASSWORD=keycloak \
+          postgres:alpine3.18
+
+        # Generate TLS cert with SAN so Chromium hostname-validates it
+        mkdir -p keycloak-certs
+        openssl req -x509 -newkey rsa:2048 \
+          -keyout keycloak-certs/keycloakkey.pem \
+          -out keycloak-certs/keycloakcrt.pem \
+          -nodes -days 365 \
+          -subj '/CN=localhost' \
+          -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+        chmod -R 777 keycloak-certs
+
+        # Patch realm file: replace placeholder domains with the actual oCIS URL.
+        # Realm dist files use either the Docker Compose hostname (ocis-server:9200)
+        # or localhost:9200 for their client redirect URIs; rewrite both so the
+        # imported realm matches wherever oCIS is actually served (e.g. 127.0.0.1:9200
+        # for e2e). Rewriting localhost is a no-op when OCIS_URL is already localhost.
+        sed -e "s|https://ocis-server:9200|${OCIS_URL}|g" \
+            -e "s|https://localhost:9200|${OCIS_URL}|g" \
+            "${REALM_DIST}" > /tmp/ocis-realm.json
+
+        timeout 30 bash -c 'until docker exec postgres pg_isready -U keycloak; do sleep 1; done'
+
+        # Start Keycloak
+        docker run -d --name keycloak --network host \
+          -e "OCIS_DOMAIN=${OCIS_URL}" \
+          -e KC_HOSTNAME=localhost \
+          -e KC_PORT=8443 \
+          -e KC_DB=postgres \
+          -e "KC_DB_URL=jdbc:postgresql://localhost:5432/keycloak" \
+          -e KC_DB_USERNAME=keycloak \
+          -e KC_DB_PASSWORD=keycloak \
+          -e KC_FEATURES=impersonation \
+          -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+          -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+          -e KC_HTTPS_CERTIFICATE_FILE=/keycloak-certs/keycloakcrt.pem \
+          -e KC_HTTPS_CERTIFICATE_KEY_FILE=/keycloak-certs/keycloakkey.pem \
+          -v "$(pwd)/keycloak-certs:/keycloak-certs:ro" \
+          -v "/tmp/ocis-realm.json:/opt/keycloak/data/import/oCIS-realm.json:ro" \
+          quay.io/keycloak/keycloak:26.2.5 \
+          start-dev --proxy-headers xforwarded \
+            --spi-connections-http-client-default-disable-trust-manager=true \
+            --import-realm --health-enabled=true
+        timeout 300 bash -c 'until curl -skf https://localhost:9000/health/ready; do sleep 5; done' \
+          || (echo "=== keycloak logs ===" && docker logs keycloak --tail 80 && exit 1)
+        echo "keycloak ready."
+
+        # Trust the cert system-wide (curl + Playwright)
+        sudo cp keycloak-certs/keycloakcrt.pem /usr/local/share/ca-certificates/keycloak.crt
+        sudo update-ca-certificates
+        echo "KEYCLOAK_CERT=$(pwd)/keycloak-certs/keycloakcrt.pem" >> "$GITHUB_ENV"
+
+    - name: Start optional services
+      if: inputs.email == 'true' || inputs.antivirus == 'true' || inputs.tika == 'true'
+      shell: bash
+      env:
+        EMAIL: ${{ inputs.email }}
+        ANTIVIRUS: ${{ inputs.antivirus }}
+        TIKA: ${{ inputs.tika }}
+      run: |
+        if [[ "$EMAIL"     == "true" ]]; then docker run -d --name mailpit --network host axllent/mailpit:v1.22.3; fi
+        if [[ "$ANTIVIRUS" == "true" ]]; then docker run -d --name clamav  --network host owncloudci/clamavd;      fi
+        if [[ "$TIKA"      == "true" ]]; then docker run -d --name tika    --network host apache/tika:3.2.2.0-full; fi
+        PIDS=()
+        [[ "$EMAIL" == "true" ]] && {
+          ( timeout 60  bash -c 'until curl -sf http://localhost:8025/api/v1/messages; do sleep 1; done' \
+            && echo "mailpit ready." ) &
+          PIDS+=($!)
+        }
+        [[ "$ANTIVIRUS" == "true" ]] && {
+          echo "Waiting for ClamAV on :3310 (may take up to 5 min for virus DB download)..."
+          ( timeout 300 bash -c 'until nc -z localhost 3310 2>/dev/null; do sleep 2; done' \
+            && echo "clamav ready." ) &
+          PIDS+=($!)
+        }
+        [[ "$TIKA" == "true" ]] && {
+          ( timeout 120 bash -c 'until curl -sf http://localhost:9998; do sleep 2; done' \
+            && echo "tika ready." ) &
+          PIDS+=($!)
+        }
+        for PID in "${PIDS[@]}"; do wait "$PID" || exit 1; done
+
+    # -------------------------------------------------------------------------
+    # 4. Install test-runner dependencies (skipped for secondary instances)
+    # -------------------------------------------------------------------------
+    - name: Cache libcurl 8.12.0
+      if: inputs.skip-test-runner-setup != 'true'
+      id: cache-libcurl
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: /opt/libcurl
+        key: libcurl-8.12.0-${{ runner.os }}
+
+    - name: Install libcurl 8.12.0 build dependencies
+      if: inputs.skip-test-runner-setup != 'true' && steps.cache-libcurl.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo NEEDRESTART_MODE=a apt-get install -y \
+          libssl-dev libnghttp2-dev libpsl-dev libldap-dev libssh-dev zlib1g-dev libvips-dev
+
+    - name: Compile libcurl 8.12.0 from source
+      if: inputs.skip-test-runner-setup != 'true' && steps.cache-libcurl.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cd /tmp
+        curl -sLO https://curl.se/download/curl-8.12.0.tar.gz
+        tar xzf curl-8.12.0.tar.gz
+        cd curl-8.12.0
+        ./configure --with-ssl --with-zlib --with-nghttp2 --prefix=/opt/libcurl \
+          --enable-versioned-symbols --silent
+        make -j$(nproc) --silent
+        sudo make install --silent
+
+    - name: Restore libcurl ldconfig
+      if: inputs.skip-test-runner-setup != 'true'
+      shell: bash
+      run: |
+        echo "/opt/libcurl/lib" | sudo tee /etc/ld.so.conf.d/libcurl-8.conf
+        sudo ldconfig
+        /opt/libcurl/bin/curl --version | head -1
+        php -r '
+          $v = curl_version()["version"];
+          echo "PHP curl: $v\n";
+          if (version_compare($v, "8.12.0", "<")) {
+            fwrite(STDERR, "FATAL: PHP sees libcurl $v, need >= 8.12.0\n");
+            exit(1);
+          }
+        '
+
+    - name: Install Composer dependencies
+      if: inputs.skip-test-runner-setup != 'true'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        COMPOSER_NO_INTERACTION=1 COMPOSER_NO_AUDIT=1 composer install --no-progress
+        COMPOSER_NO_INTERACTION=1 COMPOSER_NO_AUDIT=1 \
+          composer bin behat install --no-progress
+
+    # -------------------------------------------------------------------------
+    # 5. Generate oCIS frontend assets (only when using a pre-built binary)
+    # -------------------------------------------------------------------------
+    - name: Setup pnpm for asset generation
+      if: inputs.ocis-binary != '' || inputs.ocis-binary-artifact != ''
+      uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      with:
+        version: "10.28.1"
+
+    - name: Generate frontend assets
+      if: inputs.ocis-binary != '' || inputs.ocis-binary-artifact != ''
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: make ci-node-generate
+
+    # -------------------------------------------------------------------------
+    # 6. Resolve Docker bridge IP (when containers need to reach oCIS on host)
+    # -------------------------------------------------------------------------
+    - name: Resolve Docker bridge IP
+      if: inputs.docker-accessible == 'true'
+      shell: bash
+      run: |
+        BRIDGE_IP=$(docker network inspect bridge \
+          --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')
+        echo "OCIS_BRIDGE_IP=${BRIDGE_IP}" >> "$GITHUB_ENV"
+        echo "OCIS_DOCKER_URL=https://${BRIDGE_IP}:9200" >> "$GITHUB_ENV"
+        echo "Docker bridge IP: ${BRIDGE_IP}"
+
+    # -------------------------------------------------------------------------
+    # 7. Init oCIS + copy config files
+    # -------------------------------------------------------------------------
+    - name: Init oCIS
+      shell: bash
+      env:
+        OCIS_ACTION_PATH: ${{ github.action_path }}
+        OCIS_URL: ${{ inputs.ocis-url }}
+        OCIS_CONFIG_DIR_INPUT: ${{ inputs.ocis-config-dir }}
+        APP_REGISTRY_FILE_INPUT: ${{ inputs.app-registry-file }}
+      run: "${OCIS_ACTION_PATH}/scripts/init-ocis.sh"
+
+    # -------------------------------------------------------------------------
+    # 8. Patch web UI config (rewrite Docker Compose hostname to CI host)
+    # -------------------------------------------------------------------------
+    - name: Patch web UI config
+      if: inputs.web-ui-config != ''
+      shell: bash
+      env:
+        OCIS_URL: ${{ inputs.ocis-url }}
+        OCIS_CONFIG_DIR: ${{ inputs.ocis-config-dir }}
+        WEB_UI_CONFIG_SRC: ${{ inputs.web-ui-config }}
+      run: |
+        CONFIG_DIR="${OCIS_CONFIG_DIR:-${HOME}/.ocis/config}"
+        mkdir -p "$CONFIG_DIR"
+        sed "s|https://ocis-server:9200|${OCIS_URL}|g" \
+          "${GITHUB_WORKSPACE}/${WEB_UI_CONFIG_SRC}" \
+          > "${CONFIG_DIR}/web-ui-config.json"
+        echo "WEB_UI_CONFIG_FILE=${CONFIG_DIR}/web-ui-config.json" >> "$GITHUB_ENV"
+
+    # -------------------------------------------------------------------------
+    # 8b. Pre-start WOPI apps that require discovery before oCIS boots
+    #     cs3-wopi: app-provider probes FakeOffice discovery at startup, so
+    #     FakeOffice must be healthy before oCIS launches.
+    #     Collabora/OnlyOffice don't depend on oCIS, so start them early too
+    #     to overlap their container pull+boot with oCIS startup time.
+    # -------------------------------------------------------------------------
+    - name: Start FakeOffice (cs3-wopi — must be ready before oCIS)
+      if: contains(inputs.collaboration-apps, 'cs3-wopi')
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        docker run -d --name fakeoffice --network host \
+          -v "$(pwd):/ocis:ro" \
+          python:3-alpine \
+          python3 /ocis/tests/config/ci/fakeoffice-server.py
+        echo "Waiting for FakeOffice discovery on :8080..."
+        timeout 120 bash -c 'until curl -sf http://localhost:8080/hosting/discovery; do sleep 2; done'
+        echo "FakeOffice ready."
+
+    - name: Start Collabora (early — overlaps with oCIS boot)
+      if: contains(inputs.collaboration-apps, 'collabora')
+      shell: bash
+      env:
+        COLLABORA_IMAGE: ${{ inputs.collabora-image }}
+        OCIS_URL: ${{ inputs.ocis-url }}
+      run: |
+        docker run -d --name collabora --network host \
+          -e DONT_GEN_SSL_CERT=set \
+          -e "extra_params=--o:ssl.enable=true --o:ssl.termination=true --o:welcome.enable=false --o:net.frame_ancestors=${OCIS_URL}" \
+          --entrypoint /bin/sh \
+          "${COLLABORA_IMAGE}" \
+          -c "set -e; coolconfig generate-proof-key; bash /start-collabora-online.sh"
+
+    - name: Start OnlyOffice (early — overlaps with oCIS boot)
+      if: contains(inputs.collaboration-apps, 'onlyoffice')
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        ONLYOFFICE_IMAGE: ${{ inputs.onlyoffice-image }}
+      run: |
+        sudo systemctl stop postgresql || true
+        docker run -d --name onlyoffice --network host \
+          -e WOPI_ENABLED=true \
+          -e USE_UNAUTHORIZED_STORAGE=true \
+          -v "$(pwd)/tests/config/ci/only-office.json:/tmp/only-office.json:ro" \
+          -v "$(pwd)/tests/config/ci/onlyoffice-entrypoint.sh:/entrypoint.sh:ro" \
+          --entrypoint /bin/sh \
+          "${ONLYOFFICE_IMAGE}" \
+          /entrypoint.sh
+
+    # -------------------------------------------------------------------------
+    # 9. Start oCIS via ociswrapper (or directly when wrapper: false)
+    # -------------------------------------------------------------------------
+    - name: Start oCIS
+      shell: bash
+      env:
+        ADMIN_PASSWORD: ${{ inputs.admin-password }}
+        LOG_LEVEL: ${{ inputs.log-level }}
+        DEMO_USERS: ${{ inputs.demo-users }}
+        ANTIVIRUS_ENABLED: ${{ inputs.antivirus }}
+        EMAIL_ENABLED: ${{ inputs.email }}
+        TIKA_ENABLED: ${{ inputs.tika }}
+        KEYCLOAK_ENABLED: ${{ inputs.keycloak }}
+        WRAPPER_ENABLED: ${{ inputs.wrapper }}
+        EXTRA_SERVER_ENV: ${{ inputs.extra-server-env }}
+        OCIS_REPO_ROOT: ${{ github.workspace }}
+        OCIS_URL_OVERRIDE: ${{ inputs.ocis-url }}
+        OCIS_CONFIG_DIR_INPUT: ${{ inputs.ocis-config-dir }}
+        PID_FILE: ${{ inputs.pid-file }}
+        LOG_FILE: ${{ inputs.log-file }}
+        DEBUG_PORT_OFFSET: ${{ inputs.debug-port-offset }}
+      run: ${{ github.action_path }}/scripts/start-ocis.sh
+
+    # -------------------------------------------------------------------------
+    # 10. Wait for oCIS to be healthy
+    # -------------------------------------------------------------------------
+    - name: Wait for oCIS
+      shell: bash
+      env:
+        KEYCLOAK_ENABLED: ${{ inputs.keycloak }}
+        OCIS_URL: ${{ inputs.ocis-url }}
+        LOG_FILE: ${{ inputs.log-file }}
+      run: |
+        echo "Waiting for oCIS at ${OCIS_URL}..."
+        if [[ "${KEYCLOAK_ENABLED:-false}" == "true" ]]; then
+          timeout 300 bash -c '
+            until curl -sk "${OCIS_URL}/.well-known/openid-configuration" \
+                  -w "%{http_code}" -o /dev/null 2>/dev/null | grep -q "200"; do
+              sleep 2
+            done
+          ' || (echo "=== oCIS failed to start ===" && cat "${LOG_FILE}" 2>/dev/null | tail -50 && exit 1)
+        else
+          timeout 300 bash -c '
+            until curl -sk -uadmin:admin "${OCIS_URL}/graph/v1.0/users/admin" \
+                  -w "%{http_code}" -o /dev/null 2>/dev/null | grep -q "200"; do
+              sleep 2
+            done
+          ' || (echo "=== oCIS failed to start ===" && cat "${LOG_FILE}" 2>/dev/null | tail -50 && exit 1)
+        fi
+        echo "ocis ready."
+
+    # -------------------------------------------------------------------------
+    # 11. Trust oCIS self-signed cert
+    # -------------------------------------------------------------------------
+    # ocis init generates a self-signed TLS cert. Trust it system-wide so
+    # curl (API tests) and Playwright (e2e) can reach oCIS without --insecure.
+    # Exports OCIS_CERT for NODE_EXTRA_CA_CERTS in e2e runners.
+    - name: Trust oCIS self-signed cert
+      shell: bash
+      env:
+        OCIS_CONFIG_DIR: ${{ inputs.ocis-config-dir }}
+      run: |
+        CERT="${OCIS_CONFIG_DIR:-${HOME}/.ocis/config}/../proxy/server.crt"
+        if [[ -f "$CERT" ]]; then
+          sudo cp "$CERT" /usr/local/share/ca-certificates/ocis.crt
+          sudo update-ca-certificates
+        fi
+        echo "OCIS_CERT=$CERT" >> "$GITHUB_ENV"
+
+    # -------------------------------------------------------------------------
+    # 12. Start fakeoffice (non-cs3-wopi path) + wait for all discovery endpoints
+    # -------------------------------------------------------------------------
+    - name: Start FakeOffice
+      if: contains(inputs.collaboration-apps, 'fakeoffice') && !contains(inputs.collaboration-apps, 'cs3-wopi')
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        docker run -d --name fakeoffice --network host \
+          -v "$(pwd):/ocis:ro" \
+          python:3-alpine \
+          python3 /ocis/tests/config/ci/fakeoffice-server.py
+
+    - name: Wait for WOPI app discovery endpoints
+      if: inputs.collaboration-apps != ''
+      shell: bash
+      env:
+        COLLAB_APPS: ${{ inputs.collaboration-apps }}
+      run: |
+        PIDS=()
+        # cs3-wopi FakeOffice was already confirmed healthy in step 8b; skip re-check
+        [[ "$COLLAB_APPS" == *fakeoffice* && "$COLLAB_APPS" != *cs3-wopi* ]] && {
+          ( timeout 300 bash -c 'until curl -sf http://localhost:8080/hosting/discovery; do sleep 2; done' \
+            && echo "fakeoffice ready." ) &
+          PIDS+=($!)
+        }
+        [[ "$COLLAB_APPS" == *collabora* ]] && {
+          ( timeout 300 bash -c 'until curl -sfk https://localhost:9980/hosting/discovery; do sleep 2; done' \
+            && echo "collabora ready." ) &
+          PIDS+=($!)
+        }
+        [[ "$COLLAB_APPS" == *onlyoffice* ]] && {
+          ( timeout 300 bash -c 'until curl -sfk https://localhost:443/hosting/discovery; do sleep 2; done' \
+            && echo "onlyoffice ready." ) &
+          PIDS+=($!)
+        }
+        for PID in "${PIDS[@]}"; do wait "$PID" || exit 1; done
+        echo "All WOPI apps ready."
+
+    - name: Start collaboration services
+      if: "inputs.collaboration-apps != ''"
+      shell: bash
+      env:
+        COLLAB_APPS: ${{ inputs.collaboration-apps }}
+        OCIS_URL: ${{ inputs.ocis-url }}
+        OCIS_CONFIG_DIR_INPUT: ${{ inputs.ocis-config-dir }}
+        ACTION_PATH: ${{ github.action_path }}
+        DEBUG_PORT_OFFSET: ${{ inputs.debug-port-offset }}
+      run: |
+        source "${ACTION_PATH}/scripts/start-collab.sh"
+        CONFIG_DIR="${OCIS_CONFIG_DIR_INPUT:-${HOME}/.ocis/config}"
+
+        [[ "$COLLAB_APPS" == *collabora*  ]] && start_collab collabora  Collabora  Collabora  "https://localhost:9980" 9301 9300 9304
+        [[ "$COLLAB_APPS" == *onlyoffice* ]] && start_collab onlyoffice OnlyOffice OnlyOffice "https://localhost:443"  9311 9310 9314
+        [[ "$COLLAB_APPS" == *fakeoffice* && "$COLLAB_APPS" != *cs3-wopi* ]] && start_collab fakeoffice FakeOffice Microsoft  "http://localhost:8080"  9321 9320 9324
+        # cs3-wopi uses app-provider (legacy arch) + cs3org/wopiserver — no collaboration service needed
+
+        PIDS=()
+        for name in collabora onlyoffice fakeoffice; do
+          [[ "$COLLAB_APPS" != *$name* ]] && continue
+          [[ "$name" == "fakeoffice" && "$COLLAB_APPS" == *cs3-wopi* ]] && continue
+          port=$(case $name in collabora) echo 9304;; onlyoffice) echo 9314;; fakeoffice) echo 9324;; esac)
+          ( echo "Waiting for collaboration-${name} healthz on :${port}..."
+            timeout 300 bash -c "until curl -sf http://localhost:${port}/healthz; do sleep 2; done" \
+              || (echo "=== collab-${name} log ===" && tail -30 /tmp/collab-${name}.log && exit 1) ) &
+          PIDS+=($!)
+        done
+        for PID in "${PIDS[@]}"; do wait "$PID" || exit 1; done
+        echo "All collaboration services ready."
+        # Set WOPI_PORT for the active collaboration app (cs3-wopi sets its own in step 13)
+        if [[ "$COLLAB_APPS" != *cs3-wopi* ]]; then
+          if   [[ "$COLLAB_APPS" == *fakeoffice* ]]; then echo "WOPI_PORT=9320" >> "$GITHUB_ENV"
+          elif [[ "$COLLAB_APPS" == *collabora*  ]]; then echo "WOPI_PORT=9300" >> "$GITHUB_ENV"
+          elif [[ "$COLLAB_APPS" == *onlyoffice* ]]; then echo "WOPI_PORT=9310" >> "$GITHUB_ENV"
+          fi
+        fi
+
+    # -------------------------------------------------------------------------
+    # 13. cs3-wopi: cs3org/wopiserver + fakeoffice (via collaboration-apps: cs3-wopi)
+    # -------------------------------------------------------------------------
+    - name: Start cs3org/wopiserver
+      if: contains(inputs.collaboration-apps, 'cs3-wopi')
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        sed 's|ocis-server|localhost|g' tests/config/ci/wopiserver.conf > /tmp/wopiserver-patched.conf
+        echo "123" > /tmp/wopisecret
+        docker run -d --name wopi-cs3server --network host \
+          -v "/tmp/wopiserver-patched.conf:/etc/wopi/wopiserver.conf" \
+          -v "/tmp/wopisecret:/etc/wopi/wopisecret" \
+          --entrypoint /app/wopiserver.py \
+          cs3org/wopiserver:v10.4.0
+        echo "Waiting for cs3 wopi server on :9300..."
+        timeout 120 bash -c 'until curl -sf http://localhost:9300/wopi/cbox/endpoints 2>/dev/null || nc -z localhost 9300 2>/dev/null; do sleep 2; done'
+        echo "cs3 wopi server ready."
+        echo "WOPI_PORT=9300" >> "$GITHUB_ENV"
+
+    # -------------------------------------------------------------------------
+    # 14. Declare wopi-url output so callers can wire it explicitly
+    # -------------------------------------------------------------------------
+    - name: Set wopi-url output
+      id: wopi-url
+      if: inputs.collaboration-apps != ''
+      shell: bash
+      env:
+        WOPI_PORT: ${{ env.WOPI_PORT }}
+      run: |
+        PORT="${WOPI_PORT:-9320}"
+        echo "wopi-url=http://localhost:${PORT}" >> "$GITHUB_OUTPUT"

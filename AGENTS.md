@@ -17,9 +17,10 @@ Apache-2.0 licensed, REUSE compliant.
 
 - `<name>/action.yml` -- one action per top-level folder. Naming is
   `<product>-<purpose>`: `ocis-*`, `classic-*`, or `shared-*` when it serves both.
-- **There is no root `action.yml`, by design.** This repository is a collection, not
-  a single action, so `uses: owncloud/actions@v1` is invalid — the folder is always
-  part of the reference. (Same model as `gradle/actions`.)
+- **The root `action.yml` is a guard, not a usable action.** This repository is a
+  collection, not a single action, so `uses: owncloud/actions@v1` must fail loudly
+  instead of silently resolving to nothing — the folder is always part of the
+  reference. (Same model as `gradle/actions`.)
 - `.github/workflows/` -- this repository's own CI: workflow/action linting and the
   self-tests that exercise each action.
 - `RELEASE.md` -- the lockstep release process.
@@ -98,4 +99,5 @@ safe-settings. Do not edit `.github/CODEOWNERS` here — change
 Anything added here is consumed by CI across the entire organisation, so correctness
 and backwards compatibility matter more than convenience. When adding an action:
 create the folder, write `action.yml`, add its self-test workflow reference, document
-the inputs, and add the row to the README table. Do not add a root `action.yml`.
+the inputs, and add the row to the README table. The root `action.yml` is the guard
+action — do not repurpose it into a real action.

@@ -52,8 +52,8 @@ repository.
   a release tag is part of the history consumers trust.
 - The moving `v1` tag is the only force-push this repository performs. It is expected
   and only ever moves forward within the same major version.
-- Publishing to the **GitHub Marketplace** is not possible from this repository: a
-  Marketplace listing needs a single `action.yml` at the repository root, and there is
-  none by design. A flagship action that should be publicly discoverable gets a thin
-  `owncloud/action-<name>` repository whose root `action.yml` delegates here, so the
-  logic stays single-sourced.
+- Publishing to the **GitHub Marketplace** is not possible from this repository: the
+  root `action.yml` is a guard that errors, not a usable action, so a Marketplace
+  listing can't point at it. A flagship action that should be publicly discoverable
+  gets a thin `owncloud/action-<name>` repository whose root `action.yml` delegates
+  here, so the logic stays single-sourced.
